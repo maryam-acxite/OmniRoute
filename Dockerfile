@@ -1,4 +1,4 @@
-# ── Common base with runtime deps ──────────────────────────────────────────
+ # ── Common base with runtime deps ──────────────────────────────────────────
 FROM node:26-trixie-slim AS base
 WORKDIR /app
 
@@ -84,6 +84,8 @@ COPY scripts/build/postinstall.mjs ./scripts/build/postinstall.mjs
 COPY scripts/build/postinstallSupport.mjs ./scripts/build/postinstallSupport.mjs
 COPY scripts/build/native-binary-compat.mjs ./scripts/build/native-binary-compat.mjs
 ENV NPM_CONFIG_LEGACY_PEER_DEPS=true
+ENV NEXT_PRIVATE_TURBOPACK=0
+ENV NODE_OPTIONS="--max-old-space-size=2048"
 # --ignore-scripts blocks broad dependency install/postinstall hooks, closing
 # the supply-chain attack surface where a transitive dep can run arbitrary code
 # at install time. better-sqlite3 still needs a native binding for the target

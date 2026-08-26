@@ -7,9 +7,9 @@ import {
   getSettings,
   getCachedProviderNodes,
   getModelAliases,
-  getDatabaseSettings,
   getHiddenModelsByProvider,
 } from "@/lib/localDb";
+import { getUserDatabaseSettings } from "@/lib/db/databaseSettings";
 import { createLazyConnectionView } from "@/lib/db/providers/lazyConnectionView";
 import { extractAliasBackedModels } from "./aliasBackedModels";
 import {
@@ -69,6 +69,7 @@ import {
 import { createModelCapabilityResolutionSnapshot } from "@/lib/modelCapabilityResolutionSnapshot";
 import { getModelsDevPricing, getSyncedCapability } from "@/lib/modelsDevSync";
 import { getModelSpec } from "@/shared/constants/modelSpecs";
+import { classifyModelSupportedEndpoints } from "@/shared/constants/modelSupportedEndpoints";
 import { getModelsCatalogPrefixMode } from "@/shared/utils/featureFlags";
 import { buildReservedPrefixes, selectCompatibleNodeForPrefix } from "@/lib/providerNodePrefixes";
 import { applyCatalogPostFilters, finalizeCatalogResponse } from "./catalogResponse";
@@ -132,7 +133,11 @@ export { getCustomVisionCapabilityFields };
 // lives in ./catalogCache. Re-exported here because the existing tests import the
 // hooks from this module, and CATALOG_STALE_WHILE_REVALIDATE_MS is part of the
 // documented behavior of this endpoint.
-import { CATALOG_CACHE_TTL_MS_DEFAULT, resolveCachedCatalogResponse } from "./catalogCache";
+import {
+  CATALOG_CACHE_TTL_MS_DEFAULT,
+  resolveCachedCatalogResponse,
+  type BackgroundRefreshScheduler,
+} from "./catalogCache";
 
 export {
   CATALOG_STALE_WHILE_REVALIDATE_MS,
@@ -143,7 +148,19 @@ export {
   __flushCatalogBackgroundRefreshForTest,
   __forceCatalogInFlightRejectionForTest,
 } from "./catalogCache";
-export type { CachedCatalog } from "./catalogCache";
+export type { CachedCatalog, BackgroundRefreshScheduler } from "./catalogCache";
+
+/**
+ * Per-call options for {@link getUnifiedModelsResponse}.
+ *
+ * Restored in #11551: `/v1/models` passes Next's `after()` so the stale-while-
+ * revalidate rebuild is deferred until after the response flush. #9199 had removed
+ * the injection point while the route kept passing it, so the argument was silently
+ * dropped and the refresh ran on a plain `setTimeout`.
+ */
+export type CatalogResponseOptions = {
+  scheduleBackgroundRefresh?: BackgroundRefreshScheduler;
+};
 
 const BUILTIN_AUTO_YIELD_INTERVAL = 2;
 
@@ -157,7 +174,8 @@ function yieldCatalogBuildTurn(): Promise<void> {
  */
 export async function getUnifiedModelsResponse(
   request: Request,
-  corsHeaders: Record<string, string> = {}
+  corsHeaders: Record<string, string> = {},
+  options: CatalogResponseOptions = {}
 ) {
   const diagnosticHeaders = getCatalogDiagnosticsHeaders({ request });
 
@@ -199,6 +217,10 @@ export async function getUnifiedModelsResponse(
         hideAutoCombos:
           settingsForAuth?.hideAutoCombos === true || settingsForAuth?.autoRoutingEnabled === false,
         hideNoThinkVariants: settingsForAuth?.hideNoThinkVariants === true,
+        // #11551: the route injects Next's `after()` here so the SWR background
+        // rebuild starts only once the stale response has been flushed. Without a
+        // scheduler the cache falls back to defaultBackgroundRefreshScheduler.
+        scheduleBackgroundRefresh: options.scheduleBackgroundRefresh,
       }
     );
   } catch (err) {
@@ -229,7 +251,10 @@ async function buildCatalogPayload(
   // Falls back to the hardcoded default if not set or on error.
   let cacheTTL = CATALOG_CACHE_TTL_MS_DEFAULT;
   try {
-    const dbSettings = await getDatabaseSettings();
+    // Only the persisted cache section is needed here. The full database-settings
+    // view also calculates dbstat, WAL, schema and integrity diagnostics, which are
+    // synchronous and can pin the event loop after an otherwise cooperative build.
+    const dbSettings = getUserDatabaseSettings();
     cacheTTL = dbSettings.cache?.modelCatalogCacheTtlMs ?? CATALOG_CACHE_TTL_MS_DEFAULT;
   } catch {
     // Swallow — use default TTL on DB error
@@ -249,7 +274,7 @@ async function buildUnifiedModelsResponseCore(
   // event-loop yield, so a large deployment pins the single Node.js thread for the
   // whole build (reporter: 183 connections / 2000+ models → 10.1s stall that blocks the
   // dashboard WS heartbeat). Yield every `catYIELD_EVERY` items across the hot loops.
-  const catYIELD_EVERY = 20;
+  const catYIELD_EVERY = 5;
   let catYieldCount = 0;
   const maybeYieldCatalogBuild = async (): Promise<void> => {
     catYieldCount++;
@@ -393,11 +418,10 @@ async function buildUnifiedModelsResponseCore(
     ): boolean => {
       if (!providerKey || !modelId) return false;
       const canonical = canonicalProviderId || resolveCanonicalProviderId(providerKey);
-      const alias =
-        providerIdToAlias[canonical] || providerIdToAlias[providerKey] || undefined;
+      const alias = providerIdToAlias[canonical] || providerIdToAlias[providerKey] || undefined;
       const nodePrefix = providerIdToPrefix[providerKey] || providerIdToPrefix[canonical];
-      const keysToCheck = [providerKey, canonical, alias, nodePrefix].filter(
-        (k): k is string => Boolean(k)
+      const keysToCheck = [providerKey, canonical, alias, nodePrefix].filter((k): k is string =>
+        Boolean(k)
       );
       for (const key of keysToCheck) {
         const hiddenSet = hiddenModelsByProvider.get(key);
@@ -830,7 +854,7 @@ async function buildUnifiedModelsResponseCore(
       try {
         const suffix = autoId.replace(/^auto\/?/, "");
         if (!preparedAutoInputs) {
-          preparedAutoInputs = await prepareBuiltinAutoComboInputs();
+          preparedAutoInputs = await prepareBuiltinAutoComboInputs(capabilityResolutionSnapshot);
           await yieldCatalogBuildTurn();
         }
         const virtualCombo = await createBuiltinAutoCombo(autoId, suffix, preparedAutoInputs);
@@ -1053,11 +1077,7 @@ async function buildUnifiedModelsResponseCore(
       // `openai` provider page (codex runs on the openai-compatible connection)
       // or via the `cx` alias — check all three so a hide from any of them
       // suppresses the bare model id here.
-      if (
-        isModelHiddenBulk("codex", modelId) ||
-        isModelHiddenBulk("openai", modelId)
-      )
-        continue;
+      if (isModelHiddenBulk("codex", modelId) || isModelHiddenBulk("openai", modelId)) continue;
 
       const alias = providerIdToAlias.codex || "cx";
       const aliasId = `${alias}/${modelId}`;
@@ -1154,18 +1174,15 @@ async function buildUnifiedModelsResponseCore(
           const aliasId = `${alias}/${displayModelId}`;
           const endpoints = Array.isArray(sm.supportedEndpoints) ? sm.supportedEndpoints : ["chat"];
           const apiFormat = typeof sm.apiFormat === "string" ? sm.apiFormat : "chat-completions";
-          let modelType: string | undefined;
-          if (endpoints.includes("embeddings")) modelType = "embedding";
-          else if (endpoints.includes("rerank")) modelType = "rerank";
-          else if (endpoints.includes("images")) modelType = "image";
-          else if (endpoints.includes("audio")) modelType = "audio";
+          const classification = classifyModelSupportedEndpoints(endpoints);
+          const modelType = classification.type;
           // Same owned_by the alias/canonical entries below will carry — computed once
           // so the effort_tiers exclusion (codex/glm/kimi) and the entries agree.
           const syncedOwnedBy = resolvePublicOwnerId(providerId, canonicalProviderId);
           const syncedFields = {
             ...(modelType ? { type: modelType } : {}),
             ...(apiFormat !== "chat-completions" ? { api_format: apiFormat } : {}),
-            ...(modelType === "audio" ? { subtype: "transcription" } : {}),
+            ...(classification.subtype ? { subtype: classification.subtype } : {}),
             ...(sm.inputTokenLimit ? { context_length: sm.inputTokenLimit } : {}),
             ...(typeof sm.outputTokenLimit === "number"
               ? { max_output_tokens: sm.outputTokenLimit }
@@ -1606,11 +1623,8 @@ async function buildUnifiedModelsResponseCore(
             : ["chat"];
           const apiFormat =
             typeof model.apiFormat === "string" ? model.apiFormat : "chat-completions";
-          let modelType: string | undefined;
-          if (endpoints.includes("embeddings")) modelType = "embedding";
-          else if (endpoints.includes("rerank")) modelType = "rerank";
-          else if (endpoints.includes("images")) modelType = "image";
-          else if (endpoints.includes("audio")) modelType = "audio";
+          const classification = classifyModelSupportedEndpoints(endpoints);
+          const modelType = classification.type;
           if (
             modelType &&
             hasEquivalentSpecialtyModel(canonicalProviderId, modelId, modelType, aliasId)
@@ -1633,6 +1647,7 @@ async function buildUnifiedModelsResponseCore(
               parent: null,
               custom: true,
               ...(modelType ? { type: modelType } : {}),
+              ...(classification.subtype ? { subtype: classification.subtype } : {}),
               ...(apiFormat !== "chat-completions" ? { api_format: apiFormat } : {}),
               ...(endpoints.length > 1 || !endpoints.includes("chat")
                 ? { supported_endpoints: endpoints }
@@ -1892,7 +1907,9 @@ async function buildUnifiedModelsResponseCore(
 
       const modelId =
         model.root || (typeof model.id === "string" ? model.id.split("/").pop() : undefined);
-      return modelId ? getTokenLimit(canonicalId, modelId) : getTokenLimit(canonicalId);
+      return modelId
+        ? getTokenLimit(canonicalId, modelId, capabilityResolutionSnapshot)
+        : getTokenLimit(canonicalId, null, capabilityResolutionSnapshot);
     };
 
     let enrichmentSnapshot: CatalogEnrichmentSnapshot | undefined;
@@ -1905,7 +1922,7 @@ async function buildUnifiedModelsResponseCore(
       }
       enrichmentSnapshot = {
         modelsDevPricing,
-        capabilityResolution: capabilityResolutionSnapshot,
+        capabilityResolutionSnapshot,
         providerNodeIdsByPrefix: providerNodeIdByPrefix,
       };
       // The production profile identified pricing snapshot construction as the last

@@ -4,6 +4,7 @@ on:
   push:
     branches:
       - "main"
+  workflow_dispatch:
 
 jobs:
   build-and-deploy:
@@ -13,9 +14,6 @@ jobs:
       packages: write
 
     steps:
-      - name: Checkout Code
-        uses: actions/checkout@v4
-
       - name: Log in to GitHub Container Registry
         uses: docker/login-action@v3
         with:
@@ -23,12 +21,11 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Build and Push Docker Image
-        uses: docker/build-push-action@v5
-        with:
-          context: .
-          push: true
-          tags: ghcr.io/${{ github.repository_owner }}/omniroute:latest
+      - name: Pull Official Image & Re-tag
+        run: |
+          docker pull ghcr.io/diegosouzapw/omniroute:latest
+          docker tag ghcr.io/diegosouzapw/omniroute:latest ghcr.io/maryam-acxite/omniroute:latest
+          docker push ghcr.io/maryam-acxite/omniroute:latest
 
       - name: Trigger Dokploy Deployment
         run: |
